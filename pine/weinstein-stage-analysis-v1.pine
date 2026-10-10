@@ -1,0 +1,262 @@
+//@version=6
+indicator("Weinstein Stage Analysis + Trade Plan", shorttitle="Stage Analysis", overlay=true, max_labels_count=500)
+
+// Stan Weinstein's Stage Analysis (rules from the TraderLion guide):
+//   Stage 1 Base     -> wait
+//   Stage 2 Advance  -> ENTER on a volume breakout, ADD on pullbacks / new highs, HOLD otherwise
+//   Stage 3 Top      -> no new buys, tighten up
+//   Stage 4 Decline  -> EXIT, never hold
+// Works best on a WEEKLY chart. On a daily chart, week lengths are multiplied by 5
+// (30-week MA = 150-day, 10-week MA = 50-day).
+
+// ======================= INPUTS =======================
+grpMA = "Moving averages (lengths in WEEKS)"
+autoScale     = input.bool(true, "Daily chart: convert weeks to days (x5)", group=grpMA)
+maWeeks       = input.int(30, "Stage MA (30-week = 150-day)", minval=1, group=grpMA)
+fastWeeks     = input.int(10, "Fast MA (10-week = 50-day)", minval=1, group=grpMA)
+maType        = input.string("SMA", "MA type", options=["SMA", "WMA", "EMA"], group=grpMA)
+slopeWeeks    = input.int(4, "Slope lookback (weeks)", minval=1, group=grpMA)
+flatThreshold = input.float(0.5, "Flat MA threshold (% change over slope lookback)", minval=0.0, step=0.05, group=grpMA)
+
+grpStage = "Stage detection"
+baseWeeks    = input.int(10, "Base / resistance lookback (weeks)", minval=2, group=grpStage)
+confirmWeeks = input.int(2, "Weeks MA must stop rising/falling to change stage", minval=1, group=grpStage)
+
+grpVol = "Volume"
+volLen  = input.int(30, "Volume average length (bars)", minval=1, group=grpVol)
+volMult = input.float(2.0, "Breakout volume (x average)", minval=1.0, step=0.1, group=grpVol)
+
+grpTrade = "Trade plan"
+maxTranches = input.int(3, "Max tranches (1 entry + adds)", minval=1, maxval=10, group=grpTrade)
+coolWeeks   = input.int(3, "Min weeks between tranches", minval=0, group=grpTrade)
+entryWeeks  = input.int(4, "Breakout entry window (weeks after Stage 2 starts)", minval=1, group=grpTrade)
+zonePct     = input.float(3.0, "Pullback / retest zone (%)", minval=0.1, step=0.5, group=grpTrade)
+exitMode    = input.string("Investor", "Exit style", options=["Investor", "Trader"], group=grpTrade, tooltip="Investor: exit on a close below the 30-week MA, or Stage 4.\nTrader: also exit on a heavy-volume close below the 10-week (50-day) MA.")
+
+grpVis = "Visuals"
+showBgColors    = input.bool(true, "Color background by stage", group=grpVis)
+showBarColors   = input.bool(false, "Color price bars by stage", group=grpVis)
+showStageLabels = input.bool(true, "Label stage start / end", group=grpVis)
+showHold        = input.bool(true, "Show HOLD dots while in a position", group=grpVis)
+showTable       = input.bool(true, "Show dashboard", group=grpVis)
+show52WHigh     = input.bool(false, "Show 52-week high", group=grpVis)
+
+// ======================= CALCULATIONS =======================
+mult        = autoScale and timeframe.isdaily ? 5 : 1
+maLen       = maWeeks * mult
+fastLen     = fastWeeks * mult
+slopeLen    = slopeWeeks * mult
+baseLen     = baseWeeks * mult
+confirmBars = confirmWeeks * mult
+coolBars    = coolWeeks * mult
+entryBars   = entryWeeks * mult
+
+calcMA(src, len, type) =>
+    switch type
+        "WMA" => ta.wma(src, len)
+        "EMA" => ta.ema(src, len)
+        => ta.sma(src, len)
+
+maVal  = calcMA(close, maLen, maType)
+fastMA = calcMA(close, fastLen, maType)
+
+volMA      = ta.sma(volume, volLen)
+volRatio   = volMA > 0 ? volume / volMA : 0.0
+isHighVol  = volRatio >= volMult
+isLightVol = volRatio < 1.0
+
+maSlopePct = (maVal - maVal[slopeLen]) / maVal[slopeLen] * 100
+isRising   = maSlopePct > flatThreshold
+isFalling  = maSlopePct < -flatThreshold
+
+barsSinceRising  = nz(ta.barssince(isRising), 100000)
+barsSinceFalling = nz(ta.barssince(isFalling), 100000)
+
+baseHigh = ta.highest(high, baseLen)[1]
+
+
+lookback52W = timeframe.isweekly ? 52 : 252
+high52W     = ta.highest(high, lookback52W)
+
+// ======================= STAGE STATE MACHINE =======================
+// Each stage can only move to the stages that can follow it, so
+// Stage 1 (after a decline) and Stage 3 (after an advance) are never confused.
+var int   stage         = 0
+var int   stageStartBar = na
+var float stageHigh     = na    // highest high since the current stage began
+var float stageLow      = na    // lowest low since the current stage began (= support)
+var float breakoutLevel = na    // top of the base Stage 2 broke out of
+var bool  maRoseInStage = false // has the 30-week MA turned up during this Stage 2?
+
+bool trendUp   = close > maVal and isRising
+bool trendDown = close < maVal and isFalling
+
+int newStage = stage
+if na(maVal[slopeLen])
+    newStage := 0
+else if stage == 0
+    newStage := trendUp ? 2 : trendDown ? 4 : (maVal > maVal[maLen] ? 3 : 1)
+else if stage == 1
+    if (close > baseHigh and close > maVal and not isFalling) or trendUp
+        newStage := 2                                   // breakout from the base
+    else if close < stageLow and close < maVal and not isRising
+        newStage := 4                                   // base failed, decline resumes
+else if stage == 2
+    if trendDown
+        newStage := 4
+    else if not maRoseInStage and close < maVal
+        newStage := 1                                   // failed breakout, back into the base
+    else if maRoseInStage and (barsSinceRising >= confirmBars or (close < maVal and not isRising))
+        newStage := 3                                   // 30-week MA has flattened after rising
+else if stage == 3
+    if (close < stageLow and close < maVal) or trendDown
+        newStage := 4                                   // support broken
+    else if close > stageHigh and close > maVal and isRising
+        newStage := 2                                   // top resolved upward, advance resumes
+else if stage == 4
+    if barsSinceFalling >= confirmBars
+        newStage := 1                                   // 30-week MA stopped falling
+
+int prevStage = stage
+bool stageChanged = newStage != stage
+if stageChanged
+    if newStage == 2
+        breakoutLevel := prevStage == 0 ? na : stageHigh
+    stage         := newStage
+    stageStartBar := bar_index
+    stageHigh     := high
+    stageLow      := low
+    maRoseInStage := isRising
+else
+    stageHigh := math.max(nz(stageHigh, high), high)
+    stageLow  := math.min(nz(stageLow, low), low)
+    maRoseInStage := maRoseInStage or isRising
+
+// ======================= TRADE PLAN =======================
+var bool  inPos      = false
+var int   tranches   = 0
+var int   lastBuyBar = na
+var float entryPrice = na
+var float avgPrice   = na
+
+bool exitSig  = false
+bool enterSig = false
+bool addSig   = false
+
+// EXIT (end of Stage 2)
+bool investorExit = close < maVal or stage == 4
+bool traderExit   = investorExit or (close < fastMA and isHighVol)
+if inPos and (exitMode == "Trader" ? traderExit : investorExit)
+    exitSig    := true
+    inPos      := false
+    tranches   := 0
+    entryPrice := na
+    avgPrice   := na
+
+// ENTER (start of Stage 2)
+bool inEntryWindow = stage == 2 and bar_index - stageStartBar <= entryBars
+bool breakoutEntry = inEntryWindow and close > breakoutLevel and isHighVol
+bool retestEntry   = stage == 2 and low <= breakoutLevel * (1 + zonePct / 100) and close >= breakoutLevel and isLightVol
+if not inPos and not exitSig and not na(breakoutLevel) and (breakoutEntry or retestEntry)
+    enterSig   := true
+    inPos      := true
+    tranches   := 1
+    lastBuyBar := bar_index
+    entryPrice := close
+    avgPrice   := close
+
+// ADD (more tranches while Stage 2 is healthy and the trade is in profit)
+bool pullbackAdd = low <= fastMA * (1 + zonePct / 100) and close > fastMA and close > open and (isLightVol or volRatio[1] < 1.0)
+bool newHighAdd  = close > baseHigh and isHighVol
+bool canAdd      = inPos and not enterSig and stage == 2 and tranches < maxTranches and bar_index - lastBuyBar >= coolBars and close > entryPrice and close > fastMA
+if canAdd and (pullbackAdd or newHighAdd)
+    addSig     := true
+    avgPrice   := (avgPrice * tranches + close) / (tranches + 1)
+    tranches   += 1
+    lastBuyBar := bar_index
+
+// HOLD (in a position, nothing to do)
+bool holdSig = inPos and not enterSig and not addSig
+bool warnSig = inPos and stage == 2 and close < fastMA and isHighVol and exitMode == "Investor"
+
+// ======================= VISUALS =======================
+stageColor(s) =>
+    switch s
+        1 => color.gray
+        2 => color.green
+        3 => color.orange
+        4 => color.red
+        => color.silver
+
+stageName(s) =>
+    switch s
+        1 => "Stage 1: Base"
+        2 => "Stage 2: Advancing"
+        3 => "Stage 3: Topping"
+        4 => "Stage 4: Declining"
+        => "Not enough data"
+
+maColor = isRising ? color.green : isFalling ? color.red : color.yellow
+plot(maVal, "30-week MA", color=maColor, linewidth=3)
+plot(fastMA, "10-week MA", color=color.new(color.blue, 30), linewidth=1)
+plot(stage == 2 ? breakoutLevel : na, "Breakout level", color=color.new(color.green, 40), style=plot.style_linebr)
+plot(inPos ? avgPrice : na, "Average buy price", color=color.new(color.aqua, 0), style=plot.style_linebr)
+plot(show52WHigh ? high52W : na, "52-week high", color=color.new(color.red, 50))
+
+bgcolor(showBgColors and stage > 0 ? color.new(stageColor(stage), 88) : na)
+barcolor(showBarColors and stage > 0 ? stageColor(stage) : na)
+
+// Stage start / end markers
+if showStageLabels and stageChanged
+    if prevStage > 0
+        label.new(bar_index - 1, high[1], "S" + str.tostring(prevStage) + " end", style=label.style_label_down, color=color.new(stageColor(prevStage), 20), textcolor=color.white, size=size.small)
+    if stage > 0
+        label.new(bar_index, low, "S" + str.tostring(stage) + " start", style=label.style_label_up, color=color.new(stageColor(stage), 20), textcolor=color.white, size=size.small)
+
+// Trade signals
+plotshape(enterSig, "ENTER", style=shape.labelup, location=location.belowbar, color=color.lime, text="ENTER", textcolor=color.black, size=size.normal)
+plotshape(addSig, "ADD", style=shape.triangleup, location=location.belowbar, color=color.teal, text="ADD", textcolor=color.teal, size=size.small)
+plotshape(exitSig, "EXIT", style=shape.labeldown, location=location.abovebar, color=color.red, text="EXIT", textcolor=color.white, size=size.normal)
+plotshape(warnSig, "Stage 3 warning", style=shape.xcross, location=location.abovebar, color=color.orange, text="WARN", textcolor=color.orange, size=size.tiny)
+plotshape(showHold and holdSig, "HOLD", style=shape.circle, location=location.bottom, color=color.new(color.blue, 40), size=size.tiny)
+
+// ======================= DASHBOARD =======================
+var table dash = table.new(position.top_right, 2, 7, bgcolor=color.new(color.black, 20), border_color=color.gray, border_width=1)
+
+actionText() =>
+    string a = ""
+    if exitSig
+        a := "EXIT: sell all"
+    else if enterSig
+        a := "ENTER: buy tranche 1"
+    else if addSig
+        a := "ADD: buy tranche " + str.tostring(tranches)
+    else if inPos
+        a := stage != 2 ? "HOLD: no adds (Stage " + str.tostring(stage) + ")" : tranches >= maxTranches ? "HOLD: fully invested" : "HOLD: wait for pullback / new high"
+    else
+        a := stage == 1 ? "WAIT: base building" : stage == 2 ? "WAIT: retest of breakout" : stage == 3 ? "AVOID: no new buys" : stage == 4 ? "AVOID: never hold" : "-"
+    a
+
+if showTable and barstate.islast
+    table.cell(dash, 0, 0, "Metric", text_color=color.white, text_size=size.small, bgcolor=color.navy)
+    table.cell(dash, 1, 0, "Status", text_color=color.white, text_size=size.small, bgcolor=color.navy)
+    table.cell(dash, 0, 1, "Stage", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 1, stageName(stage), text_color=color.white, text_size=size.small, bgcolor=stageColor(stage))
+    table.cell(dash, 0, 2, "Stage since", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 2, na(stageStartBar) ? "-" : str.format_time(time[bar_index - stageStartBar], "yyyy-MM-dd"), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 3, "30-wk MA slope", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 3, isRising ? "Rising" : isFalling ? "Falling" : "Flat", text_color=color.black, text_size=size.small, bgcolor=maColor)
+    table.cell(dash, 0, 4, "Volume vs avg", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 4, str.tostring(volRatio, "#.##") + "x", text_color=color.white, text_size=size.small, bgcolor=isHighVol ? color.green : color.gray)
+    table.cell(dash, 0, 5, "Tranches", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 5, str.tostring(tranches) + " / " + str.tostring(maxTranches), text_color=color.white, text_size=size.small)
+    table.cell(dash, 0, 6, "Action now", text_color=color.white, text_size=size.small)
+    table.cell(dash, 1, 6, actionText(), text_color=color.white, text_size=size.small, bgcolor=exitSig ? color.red : enterSig or addSig ? color.green : color.new(color.blue, 40))
+
+// ======================= ALERTS =======================
+alertcondition(enterSig, "ENTER (Stage 2 breakout)", "{{ticker}}: Stage 2 ENTER signal at {{close}}")
+alertcondition(addSig, "ADD tranche", "{{ticker}}: ADD tranche signal at {{close}}")
+alertcondition(exitSig, "EXIT (end of Stage 2)", "{{ticker}}: EXIT signal at {{close}}")
+alertcondition(warnSig, "Stage 3 warning", "{{ticker}}: heavy-volume break below the 10-week MA")
+alertcondition(stageChanged and stage == 2, "Stage 2 started", "{{ticker}}: Stage 2 started")
+alertcondition(stageChanged and stage == 4, "Stage 4 started", "{{ticker}}: Stage 4 started")
